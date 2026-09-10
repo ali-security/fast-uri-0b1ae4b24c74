@@ -1,0 +1,172 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional tape file/glob selector. Empty runs the full suite.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Node.js ${{ matrix.node-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'windows-latest', 'macos-latest']
+        node-version: ['16', '18', '20', '22', '23', '24']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: package.json
+          check-latest: true
+
+      - name: Install
+        run: |
+          npm install --ignore-scripts
+
+      - name: Run tests
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          npm test
+
+      - name: Run selected tests
+        if: ${{ inputs.test-filter != '' }}
+        run: npx tape ${{ inputs.test-filter }}
+
+  test-browser:
+    name: Test browser compatibility
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'windows-latest', 'macos-latest']
+        browser: ['chromium', 'firefox', 'webkit']
+        exclude:
+          - os: ubuntu-latest
+            browser: webkit
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: package.json
+          check-latest: true
+
+      - name: Install dependencies
+        run: |
+          npm install --ignore-scripts
+
+      - if: ${{ matrix.os == 'windows-latest' }}
+        run: npx playwright install winldd
+
+      - name: Run browser tests
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          npm run test:browser:${{ matrix.browser }}
+
+      - name: Run selected browser tests
+        if: ${{ inputs.test-filter != '' }}
+        run: npx playwright-test ${{ inputs.test-filter }} --runner tape --browser=${{ matrix.browser }}
+
+  test-regression-check-node10:
+    name: Test compatibility with Node.js 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '10'
+          cache: 'npm'
+          cache-dependency-path: package.json
+          check-latest: true
+
+      - name: Install
+        run: |
+          npm install --ignore-scripts
+
+      - name: Copy project as fast-uri to node_node_modules
+        run: |
+          rm -rf ./node_modules/fast-uri/lib &&
+          rm -rf ./node_modules/fast-uri/index.js &&
+          cp -r ./lib ./node_modules/fast-uri/lib &&
+          cp ./index.js ./node_modules/fast-uri/index.js
+
+      - name: Run tests
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          npm run test:unit
+        env:
+          NODE_OPTIONS: no-network-family-autoselection
+
+      - name: Run selected tests
+        if: ${{ inputs.test-filter != '' }}
+        run: npx tape ${{ inputs.test-filter }}
+        env:
+          NODE_OPTIONS: no-network-family-autoselection
+
+  pack:
+    name: Pack npm tarball
+    needs: [test, test-browser, test-regression-check-node10]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true
+
+      # The published tarball ships upstream's .github files, so restore them
+      # byte-for-byte and drop every seal-only file before packing.
+      - name: Restore pristine .github and drop seal-only files
+        run: |
+          cp seal-pristine/dot-stale.yml.txt .github/.stale.yml
+          cp seal-pristine/dependabot.yml.txt .github/dependabot.yml
+          cp seal-pristine/tests_checker.yml.txt .github/tests_checker.yml
+          cp seal-pristine/workflows_ci.yml.txt .github/workflows/ci.yml
+          cp seal-pristine/workflows_package-manager-ci.yml.txt .github/workflows/package-manager-ci.yml
+          rm -f .github/workflows/seal-build.yml
+          rm -rf seal-pristine
+
+      - name: Pack
+        run: |
+          npm pack --ignore-scripts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: fast-uri-3.1.0.tgz
+          if-no-files-found: error
