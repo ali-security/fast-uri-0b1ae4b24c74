@@ -256,6 +256,7 @@ function parseWithStatus (uri, opts) {
   }
 
   let malformedAuthorityOrPort = false
+  let malformedIPLiteral = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -327,9 +328,24 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
+        // RFC 3986 allows "[" and "]" in a host only as the delimiters of an IP
+        // literal, so a host that carries either without being exactly "[...]"
+        // is malformed: an unterminated "[fe80::1", a stray "evil.com]", or a
+        // bracket smuggled into the middle of a reg-name. Reject those the same
+        // way as a bracketed-but-invalid literal instead of letting them reach
+        // reg-name/IDN handling, where a lenient engine silently repairs the
+        // host into a different one (SSRF / origin-allowlist bypass).
+        const hasIPLiteralBracket = parsed.host.indexOf('[') !== -1 || parsed.host.indexOf(']') !== -1
+        const bracketedIPLiteral = parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']'
         const ipv6result = normalizeIPv6(parsed.host)
-        parsed.host = ipv6result.host.toLowerCase()
-        isIP = ipv6result.isIPV6
+        isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
+        malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true)
+        parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
+
+        if (malformedIPLiteral) {
+          parsed.error = parsed.error || 'URI host is malformed.'
+          malformedAuthorityOrPort = true
+        }
       } else {
         isIP = true
       }
@@ -354,8 +370,13 @@ function parseWithStatus (uri, opts) {
 
     // check if scheme can't handle IRIs
     if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport)) {
-      // if host component is a domain name
-      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && nonSimpleDomain(parsed.host)) {
+      // if host component is a domain name. A bracketed IP literal is never a
+      // domain name, so a malformed one must not reach the WHATWG hostname
+      // parser: some engines repair it instead of rejecting it (Node < 18 drops
+      // an IPv6 zone identifier, Chromium strips the leading zeroes of an
+      // embedded IPv4), which is exactly the silent host rewrite this
+      // validation exists to prevent.
+      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && !malformedIPLiteral && nonSimpleDomain(parsed.host)) {
         // convert Unicode IDN -> ASCII IDN
         try {
           parsed.host = new URL('http://' + parsed.host).hostname
@@ -371,8 +392,9 @@ function parseWithStatus (uri, opts) {
         if (parsed.scheme !== undefined) {
           parsed.scheme = unescape(parsed.scheme)
         }
-        if (parsed.host !== undefined) {
-          parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
+        if (parsed.host !== undefined && !malformedIPLiteral) {
+          const host = isIP ? parsed.host : unescape(parsed.host)
+          parsed.host = reescapeHostDelimiters(host, isIP)
         }
       }
       if (parsed.path) {
